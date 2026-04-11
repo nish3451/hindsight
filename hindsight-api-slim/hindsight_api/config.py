@@ -374,6 +374,7 @@ ENV_WORKER_MAX_RETRIES = "HINDSIGHT_API_WORKER_MAX_RETRIES"
 ENV_WORKER_HTTP_PORT = "HINDSIGHT_API_WORKER_HTTP_PORT"
 ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
 ENV_WORKER_CONSOLIDATION_MAX_SLOTS = "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS"
+ENV_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS = "HINDSIGHT_API_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS"
 ENV_RETAIN_MAX_CONCURRENT = "HINDSIGHT_API_RETAIN_MAX_CONCURRENT"
 
 # Reflect agent settings
@@ -572,6 +573,7 @@ DEFAULT_WORKER_MAX_RETRIES = 3  # Max retries before marking task failed
 DEFAULT_WORKER_HTTP_PORT = 8889  # HTTP port for worker metrics/health
 DEFAULT_WORKER_MAX_SLOTS = 10  # Total concurrent tasks per worker
 DEFAULT_WORKER_CONSOLIDATION_MAX_SLOTS = 2  # Max concurrent consolidation tasks per worker
+DEFAULT_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS = 180  # Warn when processing rows stop heartbeating for 3 minutes
 DEFAULT_RETAIN_MAX_CONCURRENT = 4  # Max concurrent retain DB phases (HNSW reads + writes). Limits I/O contention.
 
 # Reflect agent settings
@@ -940,6 +942,7 @@ class HindsightConfig:
     worker_http_port: int
     worker_max_slots: int
     worker_consolidation_max_slots: int
+    worker_stale_processing_timeout_seconds: int
     retain_max_concurrent: int
 
     # Reflect agent settings
@@ -1493,6 +1496,12 @@ class HindsightConfig:
             worker_max_slots=int(os.getenv(ENV_WORKER_MAX_SLOTS, str(DEFAULT_WORKER_MAX_SLOTS))),
             worker_consolidation_max_slots=int(
                 os.getenv(ENV_WORKER_CONSOLIDATION_MAX_SLOTS, str(DEFAULT_WORKER_CONSOLIDATION_MAX_SLOTS))
+            ),
+            worker_stale_processing_timeout_seconds=int(
+                os.getenv(
+                    ENV_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS,
+                    str(DEFAULT_WORKER_STALE_PROCESSING_TIMEOUT_SECONDS),
+                )
             ),
             retain_max_concurrent=int(os.getenv(ENV_RETAIN_MAX_CONCURRENT, str(DEFAULT_RETAIN_MAX_CONCURRENT))),
             # Reflect agent settings

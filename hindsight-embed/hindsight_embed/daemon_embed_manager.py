@@ -159,11 +159,12 @@ class DaemonEmbedManager(EmbedManager):
             return True  # Already gone
         return False
 
-    def _clear_port(self, port: int) -> bool:
+    def _clear_port(self, port: int, replace_existing: bool = False) -> bool:
         """
         Ensure the port is free before starting a daemon.
 
-        If the port is occupied by a hindsight daemon, stop it gracefully.
+        If the port is occupied by a healthy hindsight daemon, reuse it by default.
+        If replace_existing is True, stop the existing daemon first.
         If occupied by something else, return False.
 
         Returns:
@@ -183,7 +184,11 @@ class DaemonEmbedManager(EmbedManager):
             logger.warning(f"Port {port} is in use by another process")
             return False
 
-        # It's a hindsight daemon — find its PID and stop it
+        if not replace_existing:
+            logger.info(f"Reusing existing healthy daemon on port {port}")
+            return True
+
+        # It's a hindsight daemon and replacement was requested — find its PID and stop it
         pid = self._find_pid_on_port(port)
         if pid is None:
             logger.warning(f"Port {port} has a hindsight daemon but could not find its PID")
@@ -197,17 +202,28 @@ class DaemonEmbedManager(EmbedManager):
         logger.warning(f"Old daemon (PID {pid}) did not stop in time")
         return False
 
-    def _start_daemon(self, config: dict, profile: str, extra_args: list[str] | None = None) -> bool:
+    def _start_daemon(
+        self,
+        config: dict,
+        profile: str,
+        extra_args: list[str] | None = None,
+        replace_existing: bool = False,
+    ) -> bool:
         """Start the daemon in background."""
         paths = self._profile_manager.resolve_profile_paths(profile)
         profile_label = f"profile '{profile}'" if profile else "default profile"
         daemon_log = paths.log
         port = paths.port
 
-        # Ensure port is free before starting (handles stale daemons from version upgrades)
-        if not self._clear_port(port):
+        # Ensure port is free before starting. Healthy daemons are reused by default.
+        if not self._clear_port(port, replace_existing=replace_existing):
             logger.error(f"Cannot start daemon: port {port} is in use by a non-hindsight process")
             return False
+        if not replace_existing and self.is_running(profile):
+            logger.info(f"Using already-running daemon for {profile_label} on port {port}")
+            if profile:
+                self._register_profile(profile, port, config)
+            return True
 
         # Load profile's .env file and merge with provided config
         # This fixes issue #305 where profile env vars were ignored
@@ -613,7 +629,13 @@ class DaemonEmbedManager(EmbedManager):
 
         return not self.is_ui_running(profile, ui_port)
 
-    def ensure_running(self, config: dict, profile: str, extra_args: list[str] | None = None) -> bool:
+    def ensure_running(
+        self,
+        config: dict,
+        profile: str,
+        extra_args: list[str] | None = None,
+        replace_existing: bool = False,
+    ) -> bool:
         """
         Ensure daemon is running, starting it if needed.
 
@@ -621,17 +643,23 @@ class DaemonEmbedManager(EmbedManager):
             config: Environment configuration dict (HINDSIGHT_API_* vars)
             profile: Profile name for isolation
             extra_args: Extra CLI arguments to pass to hindsight-api (e.g. ["--offline"])
+            replace_existing: Whether to replace an already healthy daemon on the profile port.
 
         Returns:
             True if daemon is running (started or already running), False on failure
         """
-        if self.is_running(profile):
+        if self.is_running(profile) and not replace_existing:
             logger.debug(f"Daemon already running for profile '{profile}'")
             if profile:
                 paths = self._profile_manager.resolve_profile_paths(profile)
                 self._register_profile(profile, paths.port, config)
             return True
-        return self._start_daemon(config, profile, extra_args=extra_args)
+        return self._start_daemon(
+            config,
+            profile,
+            extra_args=extra_args,
+            replace_existing=replace_existing,
+        )
 
     def stop(self, profile: str) -> bool:
         """

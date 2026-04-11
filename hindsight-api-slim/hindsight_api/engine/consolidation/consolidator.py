@@ -29,6 +29,7 @@ from pydantic import BaseModel, field_validator
 from ...config import get_config
 from ..llm_wrapper import sanitize_llm_output
 from ..memory_engine import fq_table
+from ..operation_metadata import ConsolidationMetadata
 from ..retain import embedding_utils
 from .prompts import build_batch_consolidation_prompt
 
@@ -221,9 +222,30 @@ async def run_consolidation_job(
     max_memories_per_batch = config.consolidation_batch_size
     llm_batch_size = max(1, config.consolidation_llm_batch_size)
 
+    async def heartbeat(
+        phase: str,
+        progress_message: str,
+        *,
+        memories_processed: int = 0,
+        total_memories: int | None = None,
+        llm_batch_index: int = 0,
+    ) -> None:
+        if not operation_id:
+            return
+        metadata = ConsolidationMetadata(
+            phase=phase,
+            progress_message=progress_message,
+            memories_processed=memories_processed,
+            total_memories=total_memories,
+            llm_batch_index=llm_batch_index,
+            last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+        ).to_dict()
+        await memory_engine._merge_operation_result_metadata(operation_id, metadata)
+
     # Check if consolidation is enabled
     if not config.enable_observations:
         logger.debug(f"Consolidation disabled for bank {bank_id}")
+        await heartbeat("completed", "Consolidation disabled", total_memories=0)
         return {"status": "disabled", "bank_id": bank_id}
 
     pool = memory_engine._pool
@@ -242,6 +264,7 @@ async def run_consolidation_job(
 
         if not bank_row:
             logger.warning(f"Bank {bank_id} not found for consolidation")
+            await heartbeat("completed", "Bank not found for consolidation", total_memories=0)
             return {"status": "bank_not_found", "bank_id": bank_id}
 
         perf.record_timing("fetch_bank", time.time() - t0)
@@ -261,10 +284,12 @@ async def run_consolidation_job(
 
     if total_count == 0:
         logger.debug(f"No new memories to consolidate for bank {bank_id}")
+        await heartbeat("completed", "No new memories to consolidate", total_memories=0)
         return {"status": "no_new_memories", "bank_id": bank_id, "memories_processed": 0}
 
     logger.info(f"[CONSOLIDATION] bank={bank_id} total_unconsolidated={total_count}")
     perf.log(f"[1] Found {total_count} pending memories to consolidate")
+    await heartbeat("running", f"Found {total_count} memories to consolidate", total_memories=total_count)
 
     # Process each memory with individual commits for crash recovery
     stats: dict[str, int] = {
@@ -322,6 +347,13 @@ async def run_consolidation_job(
         for llm_batch in llm_batches:
             llm_batch_num += 1
             llm_batch_start = time.time()
+            await heartbeat(
+                "running",
+                f"Processing consolidation batch {llm_batch_num}",
+                memories_processed=stats["memories_processed"],
+                total_memories=total_count,
+                llm_batch_index=llm_batch_num,
+            )
 
             # Snapshot perf and stats before this LLM batch
             snap_timings = perf.timings.copy()
@@ -523,6 +555,13 @@ async def run_consolidation_job(
                 + f" | input_tokens=~{input_tokens}"
                 f" | avg={llm_batch_time / len(llm_batch):.3f}s/memory"
             )
+            await heartbeat(
+                "running",
+                f"Processed {stats['memories_processed']} of {total_count} memories",
+                memories_processed=stats["memories_processed"],
+                total_memories=total_count,
+                llm_batch_index=llm_batch_num,
+            )
 
     # Build summary
     perf.log(
@@ -564,6 +603,13 @@ async def run_consolidation_job(
     stats["mental_models_refreshed"] = mental_models_refreshed
 
     perf.flush()
+    await heartbeat(
+        "completed",
+        f"Completed consolidation: processed {stats['memories_processed']} memories",
+        memories_processed=stats["memories_processed"],
+        total_memories=total_count,
+        llm_batch_index=llm_batch_num,
+    )
 
     return {"status": "completed", "bank_id": bank_id, **stats}
 

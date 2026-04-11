@@ -52,7 +52,13 @@ class RetainMetadata:
 class ConsolidationMetadata:
     """Metadata for consolidation operations."""
 
-    # Currently empty, but structure for future fields
+    phase: str
+    progress_message: str | None = None
+    memories_processed: int = 0
+    total_memories: int | None = None
+    llm_batch_index: int = 0
+    last_heartbeat_at: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
         return asdict(self)

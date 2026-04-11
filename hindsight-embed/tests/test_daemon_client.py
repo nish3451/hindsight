@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -10,6 +11,7 @@ import pytest
 
 from hindsight_embed import daemon_client
 from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+
 
 @pytest.fixture
 def config():
@@ -190,8 +192,27 @@ class TestClearPort:
         with patch.object(DaemonEmbedManager, "_is_port_in_use", return_value=False):
             assert manager._clear_port(9555) is True
 
-    def test_port_occupied_by_hindsight_stops_it(self):
-        """Port occupied by a hindsight daemon — kills it and returns True."""
+    def test_port_occupied_by_hindsight_reuses_it_by_default(self):
+        """Port occupied by a healthy hindsight daemon is reused by default."""
+        manager = DaemonEmbedManager()
+        with (
+            patch.object(DaemonEmbedManager, "_is_port_in_use", return_value=True),
+            patch("httpx.Client") as mock_httpx_cls,
+            patch.object(DaemonEmbedManager, "_find_pid_on_port") as mock_find_pid,
+            patch.object(DaemonEmbedManager, "_kill_process") as mock_kill,
+        ):
+            mock_client = MagicMock()
+            mock_client.__enter__ = Mock(return_value=mock_client)
+            mock_client.__exit__ = Mock(return_value=False)
+            mock_client.get.return_value = Mock(status_code=200)
+            mock_httpx_cls.return_value = mock_client
+
+            assert manager._clear_port(9555) is True
+            mock_find_pid.assert_not_called()
+            mock_kill.assert_not_called()
+
+    def test_port_occupied_by_hindsight_replace_existing_stops_it(self):
+        """Explicit replace kills the healthy daemon already serving the port."""
         manager = DaemonEmbedManager()
         with (
             patch.object(DaemonEmbedManager, "_is_port_in_use", return_value=True),
@@ -205,7 +226,7 @@ class TestClearPort:
             mock_client.get.return_value = Mock(status_code=200)
             mock_httpx_cls.return_value = mock_client
 
-            assert manager._clear_port(9555) is True
+            assert manager._clear_port(9555, replace_existing=True) is True
 
     def test_port_occupied_by_non_hindsight_returns_false(self):
         """Port occupied by non-hindsight process — returns False."""
@@ -251,7 +272,7 @@ class TestClearPort:
             mock_client.get.return_value = Mock(status_code=200)
             mock_httpx_cls.return_value = mock_client
 
-            assert manager._clear_port(9555) is False
+            assert manager._clear_port(9555, replace_existing=True) is False
 
     def test_kill_fails_returns_false(self):
         """Hindsight daemon found but won't die — returns False."""
@@ -268,5 +289,41 @@ class TestClearPort:
             mock_client.get.return_value = Mock(status_code=200)
             mock_httpx_cls.return_value = mock_client
 
-            assert manager._clear_port(9555) is False
+            assert manager._clear_port(9555, replace_existing=True) is False
 
+
+class TestEnsureDaemonRunning:
+    """Tests for daemon_client.ensure_daemon_running."""
+
+    def test_forwards_replace_existing_to_manager(self, config):
+        """Wrapper passes replace_existing through to the singleton manager."""
+        with patch.object(daemon_client, "_manager") as mock_manager:
+            mock_manager.ensure_running.return_value = True
+
+            assert daemon_client.ensure_daemon_running(config, "test-profile", replace_existing=True) is True
+
+            mock_manager.ensure_running.assert_called_once_with(
+                config,
+                "test-profile",
+                extra_args=None,
+                replace_existing=True,
+            )
+
+
+class TestDaemonCommand:
+    """Tests for explicit daemon command behaviors."""
+
+    def test_do_daemon_start_replace_restarts_even_if_healthy(self, config):
+        """`daemon start --replace` must bypass the early already-running return."""
+        from hindsight_embed.cli import do_daemon
+
+        args = Namespace(profile="test-profile", daemon_command="start", ui=False, replace=True)
+        mock_paths = Mock(log=Path("/tmp/hindsight-daemon.log"), port=9555)
+
+        with (
+            patch("hindsight_embed.profile_manager.ProfileManager.resolve_profile_paths", return_value=mock_paths),
+            patch.object(daemon_client, "is_daemon_running", return_value=True),
+            patch.object(daemon_client, "ensure_daemon_running", return_value=True) as mock_ensure,
+        ):
+            assert do_daemon(args, config, Mock()) == 0
+            mock_ensure.assert_called_once_with(config, "test-profile", replace_existing=True)

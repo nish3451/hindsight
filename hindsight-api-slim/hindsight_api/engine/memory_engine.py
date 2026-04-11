@@ -1249,22 +1249,43 @@ class MemoryEngine(MemoryEngineInterface):
     ) -> None:
         """Persist last HTTP attempt info into async_operations.result_metadata."""
         try:
-            pool = await self._get_pool()
-            meta = json.dumps(
+            await self._merge_operation_result_metadata(
+                operation_id,
                 {
                     "last_status_code": status_code,
                     "last_response_body": (response_body or "")[:2048],
                     "last_attempt_at": datetime.now(UTC).isoformat(),
-                }
+                },
             )
-            async with acquire_with_retry(pool) as conn:
-                await conn.execute(
-                    f"UPDATE {fq_table('async_operations')} SET result_metadata = $2::jsonb, updated_at = now() WHERE operation_id = $1",
-                    uuid.UUID(operation_id),
-                    meta,
-                )
         except Exception as meta_err:
             logger.debug(f"Failed to update webhook delivery metadata: {meta_err}")
+
+    async def _merge_operation_result_metadata(
+        self,
+        operation_id: str | uuid.UUID,
+        metadata: dict[str, Any],
+        *,
+        touch_updated_at: bool = True,
+    ) -> None:
+        """Merge fields into async_operations.result_metadata for an operation."""
+        pool = await self._get_pool()
+        operation_uuid = operation_id if isinstance(operation_id, uuid.UUID) else uuid.UUID(str(operation_id))
+        metadata_json = json.dumps(metadata, default=_json_default)
+        if touch_updated_at:
+            sql = f"""
+                UPDATE {fq_table('async_operations')}
+                SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb,
+                    updated_at = now()
+                WHERE operation_id = $1
+            """
+        else:
+            sql = f"""
+                UPDATE {fq_table('async_operations')}
+                SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb
+                WHERE operation_id = $1
+            """
+        async with acquire_with_retry(pool) as conn:
+            await conn.execute(sql, operation_uuid, metadata_json)
 
     async def _handle_webhook_delivery(self, task_dict: dict[str, Any]) -> None:
         """Deliver a webhook event via HTTP.
@@ -8071,6 +8092,11 @@ class MemoryEngine(MemoryEngineInterface):
             operation_type="consolidation",
             task_type="consolidation",
             task_payload=task_payload,
+            result_metadata=ConsolidationMetadata(
+                phase="queued",
+                progress_message="Queued for consolidation",
+                memories_processed=0,
+            ).to_dict(),
             dedupe_by_bank=True,
         )
 

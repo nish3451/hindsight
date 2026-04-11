@@ -702,6 +702,102 @@ class TestWorkerRecovery:
         assert recovered_count == 0
 
 
+class TestWorkerWatchdog:
+    """Tests for stale processing watchdog annotations."""
+
+    @pytest.mark.asyncio
+    async def test_watchdog_marks_other_worker_task_stale_without_touching_updated_at(self, pool, clean_operations):
+        """Stale tasks on another worker get annotated, but remain stale in updated_at."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        operation_id = uuid.uuid4()
+        await _ensure_bank(pool, bank_id)
+
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, worker_id, result_metadata, updated_at)
+            VALUES
+                ($1, $2, 'consolidation', 'processing', $3::jsonb, 'other-worker', '{}'::jsonb, now() - interval '10 minutes')
+            """,
+            operation_id,
+            bank_id,
+            json.dumps({"type": "consolidation", "bank_id": bank_id, "operation_id": str(operation_id)}),
+        )
+
+        before = await pool.fetchrow(
+            "SELECT updated_at FROM async_operations WHERE operation_id = $1",
+            operation_id,
+        )
+
+        poller = WorkerPoller(
+            pool=pool,
+            worker_id="watchdog-worker",
+            executor=lambda x: None,
+            stale_processing_timeout_seconds=60,
+        )
+
+        assert await poller._run_stale_processing_watchdog() == 1
+
+        after = await pool.fetchrow(
+            "SELECT updated_at, result_metadata FROM async_operations WHERE operation_id = $1",
+            operation_id,
+        )
+
+        assert after["updated_at"] == before["updated_at"]
+        metadata = after["result_metadata"] or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        watchdog = metadata["watchdog"]
+        assert watchdog["reason"] == "other_worker_no_heartbeat"
+        assert watchdog["worker_id"] == "other-worker"
+        assert watchdog["stale_for_seconds"] >= 600
+
+    @pytest.mark.asyncio
+    async def test_watchdog_marks_orphaned_self_assigned_task(self, pool, clean_operations):
+        """Tasks assigned to this worker but missing from the local active map get a distinct reason."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        operation_id = uuid.uuid4()
+        worker_id = "watchdog-worker"
+        await _ensure_bank(pool, bank_id)
+
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, worker_id, result_metadata, updated_at)
+            VALUES
+                ($1, $2, 'test', 'processing', $3::jsonb, $4, '{}'::jsonb, now() - interval '10 minutes')
+            """,
+            operation_id,
+            bank_id,
+            json.dumps({"type": "test_task", "bank_id": bank_id, "operation_id": str(operation_id)}),
+            worker_id,
+        )
+
+        poller = WorkerPoller(
+            pool=pool,
+            worker_id=worker_id,
+            executor=lambda x: None,
+            stale_processing_timeout_seconds=60,
+        )
+
+        assert await poller._run_stale_processing_watchdog() == 1
+
+        row = await pool.fetchrow(
+            "SELECT result_metadata FROM async_operations WHERE operation_id = $1",
+            operation_id,
+        )
+        metadata = row["result_metadata"] or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        watchdog = metadata["watchdog"]
+        assert watchdog["reason"] == "assigned_to_this_worker_but_not_active"
+        assert watchdog["worker_id"] == worker_id
+
+
 class TestConcurrentWorkers:
     """Tests for concurrent worker task claiming (FOR UPDATE SKIP LOCKED)."""
 

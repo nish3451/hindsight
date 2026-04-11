@@ -12,6 +12,7 @@ import time
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from .exceptions import RetryTaskAt
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 # Progress logging interval in seconds
 PROGRESS_LOG_INTERVAL = 30
+WATCHDOG_SCAN_INTERVAL = 15
+WATCHDOG_LOG_INTERVAL = 60
 
 
 def fq_table(table: str, schema: str | None = None) -> str:
@@ -63,6 +66,7 @@ class WorkerPoller:
         tenant_extension: "TenantExtension | None" = None,
         max_slots: int = 10,
         consolidation_max_slots: int = 2,
+        stale_processing_timeout_seconds: int = 180,
     ):
         """
         Initialize the worker poller.
@@ -77,6 +81,7 @@ class WorkerPoller:
                             DefaultTenantExtension with the configured schema.
             max_slots: Maximum concurrent tasks per worker
             consolidation_max_slots: Maximum concurrent consolidation tasks per worker
+            stale_processing_timeout_seconds: Warn when processing rows stop heartbeating for this long
         """
         self._pool = pool
         self._worker_id = worker_id
@@ -93,16 +98,19 @@ class WorkerPoller:
         self._tenant_extension = tenant_extension
         self._max_slots = max_slots
         self._consolidation_max_slots = consolidation_max_slots
+        self._stale_processing_timeout_seconds = stale_processing_timeout_seconds
         self._shutdown = asyncio.Event()
         self._current_tasks: set[asyncio.Task] = set()
         self._in_flight_count = 0
         self._in_flight_lock = asyncio.Lock()
         self._last_progress_log = 0.0
+        self._last_watchdog_scan = 0.0
         self._tasks_completed_since_log = 0
         # Track active tasks locally: operation_id -> (op_type, bank_id, schema, asyncio.Task)
         self._active_tasks: dict[str, tuple[str, str, str | None, asyncio.Task]] = {}
         # Track in-flight tasks by operation type
         self._in_flight_by_type: dict[str, int] = {}
+        self._watchdog_last_warned_at: dict[tuple[str | None, str], float] = {}
 
     async def _get_schemas(self) -> list[str | None]:
         """Get list of schemas to poll. Returns [None] for default schema (no prefix)."""
@@ -641,6 +649,7 @@ class WorkerPoller:
                     for task in tasks:
                         await self.execute_task(task)
 
+                    await self._run_stale_processing_watchdog()
                     # Continue immediately to claim more tasks (if slots available)
                     continue
 
@@ -656,6 +665,7 @@ class WorkerPoller:
 
                 # Log progress stats periodically
                 await self._log_progress_if_due()
+                await self._run_stale_processing_watchdog()
 
             except asyncio.CancelledError:
                 logger.info(f"Worker {self._worker_id} polling loop cancelled")
@@ -778,6 +788,85 @@ class WorkerPoller:
 
         except Exception as e:
             logger.debug(f"Failed to log progress stats: {e}")
+
+    async def _run_stale_processing_watchdog(self) -> int:
+        """Annotate processing operations that have stopped heartbeating."""
+        now = time.time()
+        if now - self._last_watchdog_scan < WATCHDOG_SCAN_INTERVAL:
+            return 0
+        self._last_watchdog_scan = now
+
+        annotated = 0
+        schemas = await self._get_schemas()
+        async with self._in_flight_lock:
+            active_operation_ids = set(self._active_tasks.keys())
+
+        for schema in schemas:
+            table = fq_table("async_operations", schema)
+            try:
+                rows = await self._pool.fetch(
+                    f"""
+                    SELECT operation_id, operation_type, bank_id, worker_id, updated_at
+                    FROM {table}
+                    WHERE status = 'processing'
+                      AND updated_at < NOW() - ($1 * interval '1 second')
+                    ORDER BY updated_at ASC
+                    """,
+                    self._stale_processing_timeout_seconds,
+                )
+            except Exception as e:
+                schema_display = f'"{schema}"' if schema else "default"
+                logger.debug(f"Worker {self._worker_id} failed stale watchdog scan for schema {schema_display}: {e}")
+                continue
+
+            observed_at = datetime.now(timezone.utc)
+            for row in rows:
+                operation_id = str(row["operation_id"])
+                cache_key = (schema, operation_id)
+                last_warned_at = self._watchdog_last_warned_at.get(cache_key, 0.0)
+                if now - last_warned_at < WATCHDOG_LOG_INTERVAL:
+                    continue
+
+                assigned_worker_id = row["worker_id"]
+                if assigned_worker_id == self._worker_id and operation_id in active_operation_ids:
+                    reason = "local_task_running_without_heartbeat"
+                elif assigned_worker_id == self._worker_id:
+                    reason = "assigned_to_this_worker_but_not_active"
+                else:
+                    reason = "other_worker_no_heartbeat"
+
+                stale_for_seconds = max(0, int((observed_at - row["updated_at"]).total_seconds()))
+                watchdog_metadata = {
+                    "watchdog": {
+                        "status": "stale",
+                        "reason": reason,
+                        "worker_id": assigned_worker_id,
+                        "observed_by_worker": self._worker_id,
+                        "stale_for_seconds": stale_for_seconds,
+                        "last_warned_at": observed_at.isoformat(),
+                    }
+                }
+
+                await self._pool.execute(
+                    f"""
+                    UPDATE {table}
+                    SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb
+                    WHERE operation_id = $1
+                    """,
+                    row["operation_id"],
+                    json.dumps(watchdog_metadata),
+                )
+
+                schema_display = schema if schema else "default"
+                logger.warning(
+                    f"[WORKER_WATCHDOG] worker={self._worker_id} schema={schema_display} "
+                    f"operation_id={operation_id} bank_id={row['bank_id']} operation_type={row['operation_type']} "
+                    f"assigned_worker={assigned_worker_id} reason={reason} stale_for={stale_for_seconds}s"
+                )
+                self._watchdog_last_warned_at[cache_key] = now
+                annotated += 1
+
+        return annotated
 
     @property
     def worker_id(self) -> str:

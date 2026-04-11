@@ -4,6 +4,7 @@ These tests exercise the real consolidation implementation with actual database 
 Note: Consolidation runs automatically after retain via SyncTaskBackend in tests.
 """
 
+import json
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -36,6 +37,98 @@ def enable_observations():
     config.enable_observations = True
     yield
     config.enable_observations = original_value
+
+
+@pytest.mark.asyncio
+async def test_submit_async_consolidation_seeds_queued_metadata(memory_no_llm_verify: MemoryEngine, request_context):
+    """Queued consolidation operations should expose initial progress metadata immediately."""
+    bank_id = f"test-consolidation-queued-{uuid.uuid4().hex[:8]}"
+    await memory_no_llm_verify.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    with patch.object(memory_no_llm_verify._task_backend, "submit_task", new=AsyncMock()) as mock_submit:
+        result = await memory_no_llm_verify.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+
+    mock_submit.assert_awaited_once()
+
+    async with memory_no_llm_verify._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, result_metadata
+            FROM async_operations
+            WHERE operation_id = $1
+            """,
+            uuid.UUID(result["operation_id"]),
+        )
+
+    assert row is not None
+    assert row["status"] == "pending"
+    metadata = row["result_metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+
+    assert metadata["phase"] == "queued"
+    assert metadata["progress_message"] == "Queued for consolidation"
+    assert metadata["memories_processed"] == 0
+
+    await memory_no_llm_verify.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_run_consolidation_job_persists_progress_metadata(
+    memory_no_llm_verify: MemoryEngine, request_context
+):
+    """Consolidation updates operation metadata with progress and final heartbeat details."""
+    bank_id = f"test-consolidation-progress-{uuid.uuid4().hex[:8]}"
+    operation_id = uuid.uuid4()
+    await memory_no_llm_verify.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+    async with memory_no_llm_verify._pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, result_metadata)
+            VALUES ($1, $2, 'consolidation', 'processing', '{}'::jsonb)
+            """,
+            operation_id,
+            bank_id,
+        )
+        await _insert_memories_with_tags(
+            conn,
+            bank_id,
+            ["Alice loves long mountain hikes."],
+            tags=["scope:test"],
+        )
+
+    result = await run_consolidation_job(
+        memory_engine=memory_no_llm_verify,
+        bank_id=bank_id,
+        request_context=request_context,
+        operation_id=str(operation_id),
+    )
+
+    async with memory_no_llm_verify._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT result_metadata
+            FROM async_operations
+            WHERE operation_id = $1
+            """,
+            operation_id,
+        )
+
+    assert row is not None
+    metadata = row["result_metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+
+    assert result["memories_processed"] >= 1
+    assert metadata["phase"] == "completed"
+    assert metadata["memories_processed"] == result["memories_processed"]
+    assert metadata["total_memories"] >= result["memories_processed"]
+    assert metadata["progress_message"]
+    assert metadata["last_heartbeat_at"]
+    datetime.fromisoformat(metadata["last_heartbeat_at"])
+
+    await memory_no_llm_verify.delete_bank(bank_id, request_context=request_context)
 
 
 class TestConsolidationIntegration:

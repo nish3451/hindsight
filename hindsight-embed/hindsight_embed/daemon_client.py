@@ -56,7 +56,12 @@ def get_daemon_url(profile: str | None = None) -> str:
     return _manager.get_url(profile)
 
 
-def ensure_daemon_running(config: dict, profile: str | None = None, extra_args: list[str] | None = None) -> bool:
+def ensure_daemon_running(
+    config: dict,
+    profile: str | None = None,
+    extra_args: list[str] | None = None,
+    replace_existing: bool = False,
+) -> bool:
     """
     Ensure daemon is running, starting it if needed.
 
@@ -65,6 +70,7 @@ def ensure_daemon_running(config: dict, profile: str | None = None, extra_args: 
                 like "llm_api_key" and env var format like "HINDSIGHT_API_LLM_API_KEY").
         profile: Profile name (None = resolve from priority).
         extra_args: Extra CLI arguments to pass to hindsight-api (e.g. ["--offline"]).
+        replace_existing: Whether to replace an already healthy daemon on the profile port.
 
     Returns:
         True if daemon is running.
@@ -72,7 +78,12 @@ def ensure_daemon_running(config: dict, profile: str | None = None, extra_args: 
     if profile is None:
         profile = resolve_active_profile()
 
-    return _manager.ensure_running(config, profile, extra_args=extra_args)
+    return _manager.ensure_running(
+        config,
+        profile,
+        extra_args=extra_args,
+        replace_existing=replace_existing,
+    )
 
 
 def stop_daemon(profile: str | None = None) -> bool:

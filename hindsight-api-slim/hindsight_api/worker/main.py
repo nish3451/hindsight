@@ -165,6 +165,7 @@ def main():
     print(f"  Max retries: {args.max_retries}")
     print(f"  Max slots: {config.worker_max_slots}")
     print(f"  Consolidation max slots: {config.worker_consolidation_max_slots}")
+    print(f"  Stale processing timeout: {config.worker_stale_processing_timeout_seconds}s")
     print(f"  HTTP server: {args.http_host}:{args.http_port}")
     print()
 
@@ -223,6 +224,7 @@ def main():
             tenant_extension=tenant_extension,
             max_slots=config.worker_max_slots,
             consolidation_max_slots=config.worker_consolidation_max_slots,
+            stale_processing_timeout_seconds=config.worker_stale_processing_timeout_seconds,
         )
 
         # Create the HTTP app for metrics/health

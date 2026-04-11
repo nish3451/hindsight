@@ -13,13 +13,21 @@ class EmbedManager(ABC):
     """Abstract interface for managing Hindsight embedded servers and profiles."""
 
     @abstractmethod
-    def ensure_running(self, config: dict, profile: str) -> bool:
+    def ensure_running(
+        self,
+        config: dict,
+        profile: str,
+        extra_args: list[str] | None = None,
+        replace_existing: bool = False,
+    ) -> bool:
         """
         Ensure daemon is running for the given profile with config.
 
         Args:
             config: Environment configuration dict (HINDSIGHT_API_* vars)
             profile: Profile name for isolation
+            extra_args: Extra CLI arguments to pass to hindsight-api.
+            replace_existing: Whether to replace an already healthy daemon on the profile port.
 
         Returns:
             True if daemon is running (started or already running), False on failure

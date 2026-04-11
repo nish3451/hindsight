@@ -513,24 +513,27 @@ def do_daemon(args, config: dict, logger):
         console = Console()
 
         if daemon_client.is_daemon_running(profile):
-            # Build title with profile and port
-            if profile:
-                already_running_title = (
-                    f"[bold yellow]Daemon Already Running[/bold yellow] [dim]({profile} @ :{port})[/dim]"
-                )
+            if getattr(args, "replace", False):
+                logger.info(f"Healthy daemon already running for profile '{profile or 'default'}'; replacing on request")
             else:
-                already_running_title = f"[bold yellow]Daemon Already Running[/bold yellow] [dim](:{port})[/dim]"
+            # Build title with profile and port
+                if profile:
+                    already_running_title = (
+                        f"[bold yellow]Daemon Already Running[/bold yellow] [dim]({profile} @ :{port})[/dim]"
+                    )
+                else:
+                    already_running_title = f"[bold yellow]Daemon Already Running[/bold yellow] [dim](:{port})[/dim]"
 
-            console.print(
-                Panel(
-                    Text("Daemon is already running", style="yellow"),
-                    title=already_running_title,
-                    border_style="yellow",
+                console.print(
+                    Panel(
+                        Text("Daemon is already running", style="yellow"),
+                        title=already_running_title,
+                        border_style="yellow",
+                    )
                 )
-            )
-            return 0
+                return 0
 
-        if daemon_client.ensure_daemon_running(config, profile):
+        if daemon_client.ensure_daemon_running(config, profile, replace_existing=getattr(args, "replace", False)):
             # Start UI if --ui flag was passed
             if getattr(args, "ui", False):
                 from .daemon_embed_manager import DaemonEmbedManager
@@ -1411,6 +1414,11 @@ def main():
             subparsers = parser.add_subparsers(dest="daemon_command")
             start_parser = subparsers.add_parser("start", help="Start the daemon")
             start_parser.add_argument("--ui", action="store_true", help="Also start the web UI after daemon is ready")
+            start_parser.add_argument(
+                "--replace",
+                action="store_true",
+                help="Replace an already healthy daemon on this profile port",
+            )
             subparsers.add_parser("stop", help="Stop the daemon")
             subparsers.add_parser("status", help="Check daemon status")
             logs_parser = subparsers.add_parser("logs", help="View daemon logs")
@@ -1502,7 +1510,7 @@ Profile management:
     profile delete NAME                                     Delete a profile
 
 Daemon management:
-    daemon start           Start the background daemon
+    daemon start [--replace]  Start the background daemon
     daemon stop            Stop the daemon
     daemon status          Check daemon status
     daemon logs [-f] [-n]  View daemon logs
