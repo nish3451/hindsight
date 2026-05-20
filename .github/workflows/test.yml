@@ -49,14 +49,26 @@ jobs:
       integrations-opencode: ${{ steps.filter.outputs.integrations-opencode }}
       dev: ${{ steps.filter.outputs.dev }}
       ci: ${{ steps.filter.outputs.ci }}
-      # Secrets are available for internal PRs, pull_request_review, and workflow_dispatch.
-      # Fork PRs via pull_request event do NOT have access to secrets.
-      has_secrets: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      has_secrets: ${{ steps.secrets.outputs.has_secrets }}
     steps:
     - uses: actions/checkout@v6
       with:
         # For pull_request_review, checkout the PR head (not the base branch)
         ref: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || '' }}
+
+    - name: Detect configured external test secrets
+      id: secrets
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+      run: |
+        if [ -n "$GCP_VERTEXAI_CREDENTIALS" ] && [ -n "$GEMINI_API_KEY" ] && [ -n "$OPENAI_API_KEY" ] && [ -n "$COHERE_API_KEY" ]; then
+          echo "has_secrets=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_secrets=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - uses: dorny/paths-filter@v4
       id: filter
@@ -795,14 +807,14 @@ jobs:
     # Only test slim variants to save disk space (they're much smaller)
     # Slim variants require external embedding providers
     - name: Setup GCP credentials for smoke test
-      if: matrix.variant == 'slim'
+      if: matrix.variant == 'slim' && needs.detect-changes.outputs.has_secrets == 'true'
       run: |
         printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Smoke test - verify container starts
-      if: matrix.variant == 'slim'
+      if: matrix.variant == 'slim' && needs.detect-changes.outputs.has_secrets == 'true'
       env:
         HINDSIGHT_API_LLM_PROVIDER: vertexai
         HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
